@@ -1,0 +1,137 @@
+  # auth via JSON Web Token (JWT) workflow
+  ### requires:
+      # Create a private key and self-signed digital cert: https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_auth_key_and_cert.htm
+      # Create a connected app for JWT: https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_auth_connected_app.htm
+      # To encrypt/decrypt private key:
+        # Encrypt the password that you want to use for deployments. Run command:
+          #openssl enc -aes-256-cbc -k <passphrase here> -P -md sha1 -nosalt
+        # Record output of key and iv, add into project as environment variables in circleci ($SANDBOX_DECRYPTION_KEY, $SANDBOX_DECRYPTION_IV)
+        # Run command:
+          #openssl enc -nosalt -aes-256-cbc -in <private key to encrypt> -out assets/<keyname>.key.enc -base64 -K <key from above> -iv <iv from above>
+    # Additional instructions on SF JWT auth flow here: https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_auth_jwt_flow.htm
+  # 
+  # 
+  #
+  # Additional Credit: https://github.com/forcedotcom/sfdx-circleci/blob/master/.circleci/config.yml
+version: 2
+
+general:
+  branches:
+    only:
+      - sandbox
+      - master
+      
+jobs:
+  doDeploymentToSandboxAndRunAllTests:
+    machine: true
+    working_directory: ~/ci_app
+    environment:
+      - DX_CLI_URL: https://developer.salesforce.com/media/salesforce-cli/sfdx-linux-amd64.tar.xz
+    steps:
+      - checkout
+      - run:
+          name: Download CLI
+          command: |
+            mkdir sfdx
+            wget -qO- $DX_CLI_URL | tar xJ -C sfdx --strip-components 1
+      - run:
+          name: Install CLI
+          command: |
+            ./sfdx/install
+            sfdx
+            mkdir tmp
+      - run:
+          #Decrypt the keys generated and stored in the assets folder
+          name: Decrypt Keys
+          command: |
+            openssl enc -nosalt -aes-256-cbc -d -in assets/sandbox.key.enc -out assets/sandbox.key -base64 -K $SANDBOX_DECRYPTION_KEY -iv $SANDBOX_DECRYPTION_IV
+            openssl enc -nosalt -aes-256-cbc -d -in assets/prod.key.enc -out assets/prod.key -base64 -K $PROD_DECRYPTION_KEY -iv $PROD_DECRYPTION_IV
+      - run:
+          name: Log into SANDBOX sandbox
+          command: |
+            sfdx force:auth:jwt:grant --clientid $SANDBOX_CLIENT_ID --jwtkeyfile assets/SANDBOX.key --username $SANDBOX_USER_NAME --setdefaultdevhubusername --setalias SANDBOX --instanceurl https://test.salesforce.com
+      - run:
+        #This shell script performs two tasks.
+            #1. Find and delete any file that contains two underscores, followed by anything, followed by two underscores with a c, followed by anything. (*__*__c*)
+            #2. Delete the entire objects directory from this deployment
+        #The first command to find and delete *__*__c* files is done because the metadata api will throw errors if deploying components outside of your namespace
+        #If you want to include objects in your deployment, remove the second command to rm the objects directory
+          name: Remove managed package data from local repo
+          command: |
+            chmod +x assets/preDeployScript.sh
+            ./assets/preDeployScript.sh
+      - run:
+        #run a check only against the sandbox. Useful if multiple users are doing development in the same sandbox. A real deployment would
+        #overwrite any code in that sandbox. This can be made into a real deployment by removing --checkonly if development work is being done
+        #in a secondary sandbox/feature branch and then deployed to a primary sandbox
+          name: Validation deployment to development
+          command: |
+            sfdx force:source:convert -r src -d deploy
+            sfdx force:mdapi:deploy --deploydir deploy --targetusername $SANDBOX_USER_NAME --testlevel RunLocalTests --wait -1 --checkonly
+      - run:
+        #if the validation to SANDBOX works, do a check only deployment of what's in the sandbox branch to production to ensure all tests pass in prod, too      
+          name: Validation deployment to production
+          command: |
+            
+            sfdx force:mdapi:deploy --deploydir deploy --targetusername $PROD_USER_NAME --testlevel RunLocalTests --wait -1 --checkonly   
+      - store_artifacts:
+          path: ~/ci_app/testResults
+  doDeploymentToProduction:
+    machine: true
+    working_directory: ~/ci_app
+    environment:
+      - DX_CLI_URL: https://developer.salesforce.com/media/salesforce-cli/sfdx-linux-amd64.tar.xz
+    steps:
+      - checkout
+      - run:
+          name: Download CLI
+          command: |
+            mkdir sfdx
+            wget -qO- $DX_CLI_URL | tar xJ -C sfdx --strip-components 1
+      - run:
+          name: Install CLI
+          command: |
+            ./sfdx/install
+            sfdx
+            mkdir tmp
+      - run:
+          name: Decrypt Keys
+          command: |
+            openssl enc -nosalt -aes-256-cbc -d -in assets/SANDBOX.key.enc -out assets/SANDBOX.key -base64 -K $SANDBOX_DECRYPTION_KEY -iv $SANDBOX_DECRYPTION_IV
+            openssl enc -nosalt -aes-256-cbc -d -in assets/prod.key.enc -out assets/prod.key -base64 -K $PROD_DECRYPTION_KEY -iv $PROD_DECRYPTION_IV
+      - run:
+          #Because you can't deploy managed package fields via the api
+          name: Remove managed package data from local repo
+          command: |
+            chmod +x assets/preDeployScript.sh
+            ./assets/preDeployScript.sh
+      - run:
+          name: Log into prod
+          command: |
+            sfdx force:auth:jwt:grant --clientid $PROD_CLIENT_ID --jwtkeyfile assets/prod.key --username $PROD_USER_NAME --setdefaultdevhubusername --setalias prod --instanceurl https://login.salesforce.com
+      - run:
+          name: Do Deployment to production 
+          command: |
+            sfdx force:source:convert -r src -d deploy
+            #run deployment with what is contained in the master branch
+            sfdx force:mdapi:deploy --deploydir deploy --targetusername $PROD_USER_NAME --wait -1 --testlevel RunLocalTests
+workflows:
+  version: 2
+  testDeploySANDBOXCommit:
+    jobs:
+      #Anything committed to the SANDBOX branch should be deployed to the SANDBOX sandbox
+        #The Salesforce API is always additive. As such:
+          #Changes to existing code or fields (if configured in the job) that are part of the commit may be overwritten by this change
+          #Net new Code/Fields in the sandbox added to a commit will be added
+          #Existing code/fields in the SANDBOX sandbox but not in the commit will be unchanged
+      - doDeploymentToSandboxAndRunAllTests:
+          filters:
+              branches:
+                only:
+                  - sandbox
+      #Any commit to master should trigger a deployment to production.
+      - doDeploymentToProduction:
+          filters:
+              branches:
+                only:
+                  - master
