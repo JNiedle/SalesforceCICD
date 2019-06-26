@@ -72,7 +72,6 @@ jobs:
         #if the validation to SANDBOX works, do a check only deployment of what's in the sandbox branch to production to ensure all tests pass in prod, too      
           name: Validation deployment to production
           command: |
-            
             sfdx force:mdapi:deploy --deploydir deploy --targetusername $PROD_USER_NAME --testlevel RunLocalTests --wait -1 --checkonly   
       - store_artifacts:
           path: ~/ci_app/testResults
